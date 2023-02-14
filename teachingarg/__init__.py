@@ -2,9 +2,11 @@
 from math import exp, log
 import networkx.algorithms.non_randomness
 
+import json
+
 import random
-print("Setting random seed")
-random.seed(3)
+# print("Setting random seed")
+# random.seed(3)
 
 from random import random, shuffle, choices
 from functools import partial
@@ -15,19 +17,39 @@ from numpy.random import exponential
 import numpy as np
 from time import sleep
 import matplotlib.pyplot as plt
+from collections import defaultdict
 
 
 class Lineage(object):
     """
     Lineages are the edges of our graph
     """
-    def __init__(self, down, intervals):
+    def __init__(self, lineageid=None, down=None, up=None, intervals=None):
+        self.lineageid = lineageid
         self.down = down # node at bottom of edte
-        self.up = None # node at top of edge
+        self.up = up # node at top of edge
         self.intervals = intervals
 
+    def __hash__(self):
+        return self.lineageid
+
+    def __eq__(self, other):
+        return self.lineageid == other.lineageid  
+
     def __repr__(self):
-        return f'{self.down}:{self.intervals}'
+        return f'{self.lineageid}:{self.intervals}'
+
+    def get_dict(self):
+        d = self.__dict__.copy()
+        if d['up']:
+            d['up'] = d['up'].nodeid
+        d['down'] = d['down'].nodeid
+        return d
+
+    def toJSON(self):
+        return json.dumps(self, default=self.get_dict, sort_keys=True, indent=4)
+
+
 
 class Node():
     """
@@ -44,32 +66,59 @@ class Node():
 
 class Leaf(Node):
 
-    def __init__(self, nodeid, height):
+    def __init__(self, nodeid=None, height=None, parent=None, intervals=[(0, 1)], xpos=None):
         self.nodeid = nodeid
         self.height = height
-        self.intervals = [(0, 1)]
-        self.parent = None
-        self.xpos = None
+        self.intervals = intervals
+        self.parent = parent
+        self.xpos = xpos
+
+    def get_dict(self):
+        d = self.__dict__.copy()
+        d['parent'] = d['parent'].lineageid
+        return d
+
+    def toJSON(self):
+        return json.dumps(self, default=self.get_dict, sort_keys=True, indent=4)
 
 class Coalescent(Node):
 
-    def __init__(self, nodeid, height, children):
+    def __init__(self, nodeid=None, height=None, children=None, parent=None, xpos=None):
         self.nodeid = nodeid
         self.height = height
         self.children = children
-        self.parent = None
-        self.xpos = None
+        self.parent = parent
+        self.xpos = xpos
+
+    def get_dict(self):
+        d = self.__dict__.copy()
+        d['children'] = [c.lineageid for c in d['children']]
+        d['parent'] = d['parent'].lineageid
+        return d
+
+    def toJSON(self):
+        return json.dumps(self, default=self.get_dict, sort_keys=True, indent=4)
 
 class Recombination(Node):
 
-    def __init__(self, nodeid, height, child, recomb_point):
+    def __init__(self, nodeid=None, height=None, child=None, recomb_point=None, left_parent=None, right_parent=None, xpos=None):
         self.nodeid = nodeid
         self.height = height
         self.child = child
-        self.left_parent = None
-        self.right_parent = None
+        self.left_parent = left_parent
+        self.right_parent = right_parent
         self.recomb_point = recomb_point
-        self.xpos = None
+        self.xpos = xpos
+
+    def get_dict(self):
+        d = self.__dict__.copy()
+        d['left_parent'] = d['left_parent'].lineageid
+        d['right_parent'] = d['right_parent'].lineageid
+        d['child'] = d['child'].lineageid
+        return d
+
+    def toJSON(self):
+        return json.dumps(self, default=self.get_dict, sort_keys=True, indent=4)
 
 def flatten(list_of_tps):
  
@@ -133,6 +182,10 @@ def interval_intersect(a, b):
 def interval_sum(intervals):
     return sum(e - s for (s, e) in intervals)
 
+def interval_span(intervals):
+    starts, ends = zip(*intervals)
+    return max(ends) - min(starts)
+
 def interval_split(intervals, pos):
     left, right = list(), list()
     for s, e in intervals:
@@ -144,6 +197,10 @@ def interval_split(intervals, pos):
         else:
             right.append((s, e))
     return left, right
+
+def interval_any_shared_borders(a, b):
+    flat = flatten(a) + flatten(b)
+    return len(flat) > len(set(flat))
 
 def x_positions_traverse(node, offset):
     """
@@ -177,12 +234,14 @@ def add_node_x_positions(nodes):
     nodes[-1].xpos = offset
     x_positions_traverse(nodes[-1], offset)
 
-def get_arg_nodes(n=5, N=10000, r=1e-8, L=2e3):
+def get_arg_nodes(n=5, N=10000, r=1e-8, L=5e3, simulation="arg"):
     """
     Simulates an ARG
     """
     # because we use the sequence interval from 0 to 1
     r = r * L
+
+    assert simulation in ["arg", "smcprime"]#, "SMC"]
 
     nodes = list()
     live = list() # live lineages
@@ -190,10 +249,12 @@ def get_arg_nodes(n=5, N=10000, r=1e-8, L=2e3):
     for i in range(n):
         leaf = Leaf(i, height=0)
         nodes.append(leaf)
-        lin = Lineage(down=leaf, intervals=[(0, 1)])
+        lin = Lineage(lineageid=i, down=leaf, intervals=[(0, 1)])
+        leaf.parent = lin
         live.append(lin)
         last_node = i # max node number used so far
-
+        last_lineage = i
+        
     while len(live) > 1:
         shuffle(live)
 
@@ -204,7 +265,26 @@ def get_arg_nodes(n=5, N=10000, r=1e-8, L=2e3):
         height = wating_time + nodes[-1].height
         if random() < coal_prob / (coal_prob + rec_prob):
             # coalescence
+
+            # if full arg:            
+            a, b = 0, 1
+
+            if simulation == "smcprime'":
+                # intervals must overlap or be adjacent:
+                while not (interval_union(live[a].intervals, live[b].intervals) \
+                    or interval_any_shared_borders(live[a].intervals, live[b].intervals)):
+                    a, b = choices(range(len(live)), k=2)
+            # elif simulation == "SMC":
+            #     # intervals must overlap
+            #     while not interval_intersect(live[a].intervals, live[b].intervals):
+            #         a, b = choices(range(len(live)), k=2)
+
+            #     # if the two that coalesce makes a diamond, then we need to roll back
+            #     # recombination
+
+
             lin_a, lin_b = live.pop(), live.pop()
+
             intervals = interval_union(lin_a.intervals, lin_b.intervals)
             # new node
             node_c = Coalescent(nodeid=last_node+1, height=height, 
@@ -217,12 +297,14 @@ def get_arg_nodes(n=5, N=10000, r=1e-8, L=2e3):
             lin_b.up = node_c
 
             # new lineage
-            lin_c = Lineage(down=node_c, intervals=intervals) # fixme intervals
+            lin_c = Lineage(lineageid=last_lineage+1, down=node_c, intervals=intervals) # fixme intervals
+            last_lineage += 1
             live.append(lin_c)
             node_c.parent = lin_c
         else:
             # recombination
-            rec_lin = choices(live, weights=[interval_sum(x.intervals) for x in live], k=1)[0]
+            # rec_lin = choices(live, weights=[interval_sum(x.intervals) for x in live], k=1)[0]
+            rec_lin = choices(live, weights=[interval_span(x.intervals) for x in live], k=1)[0]
             live.remove(rec_lin)
 
             # total ancestral material
@@ -248,8 +330,10 @@ def get_arg_nodes(n=5, N=10000, r=1e-8, L=2e3):
             # two new lineages both refering back to recombination node
             intervals_a, intervals_b = interval_split(rec_lin.intervals, recomb_point)
             assert interval_sum(intervals_a) and interval_sum(intervals_b) 
-            lin_a = Lineage(down=rec_node, intervals=intervals_a)
-            lin_b = Lineage(down=rec_node, intervals=intervals_b)
+            lin_a = Lineage(lineageid=last_lineage+1, down=rec_node, intervals=intervals_a)
+            last_lineage += 1
+            lin_b = Lineage(lineageid=last_lineage+1, down=rec_node, intervals=intervals_b)
+            last_lineage += 1
             live.append(lin_a)
             live.append(lin_b)
 
@@ -296,6 +380,49 @@ def get_breakpoints(nodes):
         if type(n) is Recombination:
             breakpoints.append(n.recomb_point)
     return sorted(breakpoints)
+
+def get_parent_lineages(nodes, root=True):
+    """
+    Get list of parent lineages of nodes ordered by id
+    """
+
+    lineages = list()
+    for node in nodes:
+        if type(node) is Coalescent:
+            lineages.append(node.parent)
+        if type(node) is Recombination:
+            lineages.append(node.left_parent)
+            lineages.append(node.right_parent)
+        if type(node) is Leaf:
+            lineages.append(node.parent)
+
+    # get unique and sort them so lineageid matches index
+    lineages = list(set(lineages))
+    lineages.sort(key=lambda x: x.lineageid)
+
+    if not root:
+        # remove dangling root lineage
+        lineages = lineages[:-1]
+
+    return lineages
+
+def get_child_lineages(nodes):
+    """
+    Get list of child lineages of nodes ordered by id
+    """
+
+    lineages = list()
+    for node in nodes:
+        if type(node) is Coalescent:
+            lineages.extend(node.children)
+        if type(node) is Recombination:
+            lineages.append(node.child)
+
+    # get unique and sort them so lineageid matches index
+    lineages = list(set(lineages))
+    lineages.sort(key=lambda x: x.lineageid)
+
+    return lineages
 
 def traverse_marginal(node, interval):
     """
@@ -402,10 +529,86 @@ def draw_graph(nodes):
 
     plt.show()
 
+def rescale_positions(nodes):
+    """
+    Rescales xpos and heights to 0,1 range
+    """
+    max_height = max(n.height for n in nodes)
+    max_xpos = max(n.xpos for n in nodes)
+    min_xpos = min(n.xpos for n in nodes)
+    for node in nodes:
+        node.xpos = (node.xpos - min_xpos) / (max_xpos-min_xpos)
+        node.height = node.height / max_height
+
+def arg2json(nodes):
+
+    lineages = get_parent_lineages(nodes)
+
+    json_data = dict(Coalescent=[], Recombination=[], Leaf=[], 
+                        Lineage=[l.get_dict() for l in lineages])
+    for node in nodes:
+        json_data[node.__class__.__name__].append(node.get_dict())
+
+    return json.dumps(json_data, indent=4)
+
+def json2arg(json_str):
+
+    nodes = list()
+
+    data = json.loads(json_str)
+
+    # make lineages (with indexes instead of node refs)
+    lineages = [Lineage(**data) for data in data['Lineage']]
+
+    for node_data in data['Coalescent']:            
+        # make the node
+        node = Coalescent(**node_data)
+        # populate the parent and children with actual lineages
+        node.parent = lineages[node.parent]
+        node.children = [lineages[i] for i in node.children]
+        nodes.append(node)
+
+    for node_data in data['Recombination']:
+        # make the node
+        node = Recombination(**node_data)
+        # populate the parents and child with actual lineages
+        node.left_parent = lineages[node.left_parent]
+        node.right_parent = lineages[node.right_parent]
+        node.child = lineages[node.child]
+        nodes.append(node)
+
+    for node_data in data['Leaf']:
+        # make the node
+        node = Leaf(**node_data)
+        # populate the parent with actual lineages
+        node.parent = lineages[node.parent]
+        nodes.append(node)
+
+    nodes.sort(key=lambda x: x.nodeid)
+
+    # populate up and down with the nodes
+    for lineage in lineages:
+        lineage.down = nodes[lineage.down]
+        if lineage.up is not None:
+            lineage.up = nodes[lineage.up]
+
+    return nodes
+
 if __name__ == '__main__':
 
     # get arg and add positions
     nodes = get_arg_nodes()
+
+
+    json_str = arg2json(nodes)
+
+    retrieved_nodes = json2arg(json_str)
+
+    print(nodes)
+    print(retrieved_nodes)
+    print(nodes == retrieved_nodes)
+
+
 
     # get breakpoints
     breakpoints = get_breakpoints(nodes)
@@ -417,13 +620,12 @@ if __name__ == '__main__':
     marg_arg = marginal_arg(nodes, [0, breakpoints[1]])
 
 
-    # draw graphs for testing
-    draw_graph(nodes)
-    draw_graph(marg_arg)
+    # # draw graphs for testing
+    # draw_graph(nodes)
+    # draw_graph(marg_arg)
 
-    draw_graph(nodes)
-    for tree in marginal_trees(nodes):
-        print([n.xpos for n in tree])
-        draw_graph(tree)
-
+    # draw_graph(nodes)
+    # for tree in marginal_trees(nodes):
+    #     print([n.xpos for n in tree])
+    #     draw_graph(tree)
 
